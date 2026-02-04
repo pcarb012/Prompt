@@ -1,0 +1,222 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Converted from QuantConnect Python - Volatility Squeeze Alpha Strategy
+
+//@version=6
+strategy("Volatility Squeeze Alpha", overlay=true, initial_capital=2000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.01, calc_on_every_tick=false)
+
+// ==================== INPUTS ====================
+// Bollinger Bands Settings
+bb_length = input.int(20, "BB Length", minval=1, group="Bollinger Bands")
+bb_mult = input.float(2.0, "BB StdDev Multiplier", minval=0.1, step=0.1, group="Bollinger Bands")
+
+// ATR Settings
+atr_length = input.int(14, "ATR Length", minval=1, group="ATR")
+atr_stop_mult = input.float(2.5, "ATR Stop Multiplier", minval=0.1, step=0.1, group="ATR")
+atr_tight_mult = input.float(1.5, "ATR Tight Stop Multiplier", minval=0.1, step=0.1, group="ATR")
+
+// Daily EMA Filter
+daily_ema_length = input.int(50, "Daily EMA Length", minval=1, group="Trend Filter")
+use_daily_filter = input.bool(true, "Use Daily EMA Filter", group="Trend Filter")
+
+// Squeeze Detection
+bw_lookback = input.int(50, "Bandwidth Lookback Period", minval=10, group="Squeeze Detection")
+bw_threshold = input.float(1.2, "Bandwidth Threshold Multiplier", minval=0.5, step=0.1, group="Squeeze Detection", tooltip="Current BW must be below Avg BW * this value")
+
+// Risk Management
+base_risk_pct = input.float(2.5, "Base Risk %", minval=0.1, step=0.1, group="Risk Management")
+max_drawdown_threshold = input.float(15.0, "Max Drawdown Threshold %", minval=1.0, step=1.0, group="Risk Management")
+reduced_risk_mult = input.float(0.5, "Risk Multiplier After Drawdown", minval=0.1, step=0.1, group="Risk Management")
+profit_threshold_pct = input.float(2.0, "Profit % for Tight Stop", minval=0.1, step=0.1, group="Risk Management")
+
+// Cooldown Period (in bars)
+cooldown_bars = input.int(12, "Cooldown Bars After Exit", minval=0, group="Trade Management", tooltip="Number of bars to wait before next entry after exit")
+
+// Debug Mode
+show_debug = input.bool(true, "Show Debug Info", group="Display")
+
+// ==================== INDICATORS ====================
+// Bollinger Bands (uses chart timeframe)
+bb_basis = ta.sma(close, bb_length)
+bb_dev = bb_mult * ta.stdev(close, bb_length)
+bb_upper = bb_basis + bb_dev
+bb_lower = bb_basis - bb_dev
+
+// ATR
+atr = ta.atr(atr_length)
+
+// Daily EMA (Multi-timeframe) - with proper na handling
+daily_ema_raw = request.security(syminfo.tickerid, "D", ta.ema(close, daily_ema_length), lookahead=barmerge.lookahead_off)
+daily_ema = na(daily_ema_raw) ? close : daily_ema_raw  // Fallback to close if na
+
+// ==================== BANDWIDTH CALCULATION ====================
+// Bandwidth formula: (Upper - Lower) / Middle
+bandwidth = bb_basis != 0 ? (bb_upper - bb_lower) / bb_basis : 0.0
+
+// Average Bandwidth over lookback period
+avg_bandwidth = ta.sma(bandwidth, bw_lookback)
+
+// Squeeze Detection: Current bandwidth is below average * threshold
+// When avg_bandwidth is na (not enough data), allow trading (like original Python)
+is_squeezed = na(avg_bandwidth) ? true : bandwidth < (avg_bandwidth * bw_threshold)
+
+// ==================== DRAWDOWN CALCULATION ====================
+var float max_equity = strategy.initial_capital
+current_equity = strategy.equity
+
+if current_equity > max_equity
+    max_equity := current_equity
+
+current_drawdown = max_equity > 0 ? (max_equity - current_equity) / max_equity : 0.0
+
+// Dynamic Risk Adjustment
+risk_multiplier = current_drawdown < (max_drawdown_threshold / 100) ? 1.0 : reduced_risk_mult
+current_risk = (base_risk_pct / 100) * risk_multiplier
+
+// ==================== POSITION TRACKING ====================
+var float entry_price = 0.0
+var float highest_price = 0.0
+var float stop_price = 0.0
+var int bars_since_exit = 999  // Start high to allow immediate trading
+
+// Track bars since last exit
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    bars_since_exit := 0
+else if strategy.position_size == 0
+    bars_since_exit := bars_since_exit + 1
+
+// ==================== ENTRY CONDITIONS ====================
+// 1. Not in a position
+not_in_position = strategy.position_size == 0
+
+// 2. Price above Daily EMA (trend filter) - optional
+trend_bullish = use_daily_filter ? close > daily_ema : true
+
+// 3. Volatility is squeezed (low bandwidth)
+squeeze_ok = is_squeezed
+
+// 4. Price breaks above upper Bollinger Band
+bb_breakout = close > bb_upper
+
+// 5. Cooldown period has passed
+cooldown_passed = bars_since_exit >= cooldown_bars
+
+// 6. Indicators are ready
+indicators_ready = not na(bb_upper) and not na(atr) and atr > 0
+
+// Combined entry condition
+entry_condition = not_in_position and trend_bullish and squeeze_ok and bb_breakout and cooldown_passed and indicators_ready
+
+// ==================== ENTRY LOGIC ====================
+if entry_condition
+    // Calculate position size based on risk and ATR
+    stop_distance = atr * atr_stop_mult
+
+    if stop_distance > 0 and current_equity > 0
+        // Risk-based position sizing
+        risk_amount = current_equity * current_risk
+        qty = risk_amount / stop_distance
+
+        // Ensure minimum quantity
+        qty := math.max(qty, syminfo.mintick)
+
+        strategy.entry("Long", strategy.long, qty=qty)
+        entry_price := close
+        highest_price := close
+        stop_price := close - stop_distance
+
+// ==================== EXIT LOGIC ====================
+if strategy.position_size > 0
+    // Update highest price for trailing stop
+    if close > highest_price
+        highest_price := close
+
+    // Calculate profit percentage
+    profit_pct = entry_price > 0 ? (close - entry_price) / entry_price : 0.0
+
+    // Dynamic trailing stop: tighten when in profit
+    trail_multiplier = profit_pct > (profit_threshold_pct / 100) ? atr_tight_mult : atr_stop_mult
+    trailing_level = highest_price - (atr * trail_multiplier)
+
+    // Update stop price (only move up, never down)
+    stop_price := math.max(stop_price, trailing_level)
+
+    // Exit conditions:
+    // 1. Price falls below trailing stop
+    exit_stop = close < stop_price
+
+    // 2. Price falls below Daily EMA (trend reversal) - only if filter is enabled
+    exit_trend = use_daily_filter and close < daily_ema
+
+    if exit_stop
+        strategy.close("Long", comment="Trailing Stop")
+    else if exit_trend
+        strategy.close("Long", comment="Trend Exit")
+
+// ==================== PLOTTING ====================
+// Bollinger Bands
+p_upper = plot(bb_upper, "BB Upper", color=color.new(color.blue, 0), linewidth=1)
+plot(bb_basis, "BB Basis", color=color.new(color.orange, 0), linewidth=1)
+p_lower = plot(bb_lower, "BB Lower", color=color.new(color.blue, 0), linewidth=1)
+fill(p_upper, p_lower, color=color.new(color.blue, 90))
+
+// Daily EMA
+plot(use_daily_filter ? daily_ema : na, "Daily EMA", color=color.new(color.purple, 0), linewidth=2)
+
+// Stop Price (only when in position)
+plot(strategy.position_size > 0 ? stop_price : na, "Stop Price", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+
+// Entry/Highest Price tracking
+plot(strategy.position_size > 0 ? entry_price : na, "Entry Price", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size > 0 ? highest_price : na, "Highest Price", color=color.new(color.teal, 0), style=plot.style_linebr, linewidth=1)
+
+// ==================== SQUEEZE INDICATOR ====================
+// Background color when squeeze is active
+bgcolor(is_squeezed ? color.new(color.yellow, 90) : na, title="Squeeze Active")
+
+// Show entry signals on chart
+plotshape(entry_condition, title="Entry Signal", location=location.belowbar, color=color.green, style=shape.triangleup, size=size.small)
+
+// ==================== DEBUG INFO TABLE ====================
+var table info_table = table.new(position.top_right, 2, 12, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast and show_debug
+    table.cell(info_table, 0, 0, "Metric", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 0, "Value", text_color=color.white, text_size=size.small)
+
+    table.cell(info_table, 0, 1, "Bandwidth", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 1, str.tostring(bandwidth, "#.####"), text_color=color.white, text_size=size.tiny)
+
+    table.cell(info_table, 0, 2, "Avg Bandwidth", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 2, str.tostring(avg_bandwidth, "#.####"), text_color=color.white, text_size=size.tiny)
+
+    table.cell(info_table, 0, 3, "Squeezed", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 3, is_squeezed ? "YES" : "NO", text_color=is_squeezed ? color.green : color.red, text_size=size.tiny)
+
+    table.cell(info_table, 0, 4, "Trend Bullish", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 4, trend_bullish ? "YES" : "NO", text_color=trend_bullish ? color.green : color.red, text_size=size.tiny)
+
+    table.cell(info_table, 0, 5, "BB Breakout", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 5, bb_breakout ? "YES" : "NO", text_color=bb_breakout ? color.green : color.red, text_size=size.tiny)
+
+    table.cell(info_table, 0, 6, "Cooldown OK", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 6, cooldown_passed ? "YES" : "NO", text_color=cooldown_passed ? color.green : color.red, text_size=size.tiny)
+
+    table.cell(info_table, 0, 7, "Drawdown %", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 7, str.tostring(current_drawdown * 100, "#.##") + "%", text_color=current_drawdown > (max_drawdown_threshold / 100) ? color.red : color.white, text_size=size.tiny)
+
+    table.cell(info_table, 0, 8, "ATR", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 8, str.tostring(atr, "#.####"), text_color=color.white, text_size=size.tiny)
+
+    table.cell(info_table, 0, 9, "Position", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 9, strategy.position_size > 0 ? "LONG" : "FLAT", text_color=strategy.position_size > 0 ? color.green : color.gray, text_size=size.tiny)
+
+    table.cell(info_table, 0, 10, "Bars Since Exit", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 10, str.tostring(bars_since_exit), text_color=color.white, text_size=size.tiny)
+
+    table.cell(info_table, 0, 11, "Daily EMA", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 11, str.tostring(daily_ema, "#.##"), text_color=color.white, text_size=size.tiny)
+
+// ==================== ALERTS ====================
+alertcondition(entry_condition, title="Squeeze Breakout Entry", message="Volatility Squeeze Breakout - LONG Entry Signal on {{ticker}}")
+alertcondition(strategy.position_size > 0 and close < stop_price, title="Trailing Stop Hit", message="Trailing Stop Hit on {{ticker}}")
+alertcondition(strategy.position_size > 0 and close < daily_ema, title="Trend Exit", message="Price below Daily EMA - Exit Signal on {{ticker}}")
