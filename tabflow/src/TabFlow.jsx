@@ -714,6 +714,31 @@ export default function TabFlow() {
               ))}
             </div>
           </div>
+          {/* Song Selector Dropdown */}
+          <div style={{ marginBottom: 12 }}>
+            <select
+              value={song.id || ""}
+              onChange={e => {
+                const selected = library.find(s => s.id === e.target.value);
+                if (selected) loadSong(selected);
+              }}
+              style={{
+                width: "100%", padding: "10px 14px", borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.1)", background: "rgba(255,255,255,0.04)",
+                color: "#fff", fontSize: 13, fontWeight: 600, cursor: "pointer",
+                fontFamily: "'JetBrains Mono', monospace", outline: "none",
+                appearance: "none", WebkitAppearance: "none",
+                backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E")`,
+                backgroundRepeat: "no-repeat", backgroundPosition: "right 14px center",
+              }}
+            >
+              {library.map(s => (
+                <option key={s.id} value={s.id} style={{ background: "#1a1a2e", color: "#fff" }}>
+                  {s.title} — {s.bpm} BPM · {s.tracks ? s.tracks.reduce((a, t) => a + (t.notes?.length || 0), 0) : (s.notes?.length || 0)} notes
+                </option>
+              ))}
+            </select>
+          </div>
           {/* Track Selector Bar */}
           {hasTracks && (
             <div style={{marginBottom:12}}>
