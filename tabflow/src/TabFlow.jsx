@@ -90,9 +90,178 @@ function getActiveSong(song, trackIdx) {
   return { ...song, notes: t.notes || [], tuning: t.tuning || ["e","B","G","D","A","E"] };
 }
 // ============================================================================
+// PDF TAB PARSER
+// ============================================================================
+const STANDARD_TUNING = ["e","B","G","D","A","E"];
+const STRING_LABELS = {
+  "e": 0, "B": 1, "b": 1, "G": 2, "g": 2, "D": 3, "d": 3, "A": 4, "a": 4, "E": 5,
+};
+
+async function extractTextFromPdf(pdfDoc) {
+  const allText = [];
+  for (let i = 1; i <= pdfDoc.numPages; i++) {
+    const page = await pdfDoc.getPage(i);
+    const content = await page.getTextContent();
+    // Group text items by vertical position (y coordinate) to reconstruct lines
+    const lines = {};
+    content.items.forEach(item => {
+      const y = Math.round(item.transform[5]);
+      if (!lines[y]) lines[y] = [];
+      lines[y].push({ x: item.transform[4], text: item.str });
+    });
+    // Sort by y descending (PDF coords go bottom-up), then by x
+    const sortedYs = Object.keys(lines).map(Number).sort((a, b) => b - a);
+    sortedYs.forEach(y => {
+      const lineItems = lines[y].sort((a, b) => a.x - b.x);
+      allText.push(lineItems.map(i => i.text).join(""));
+    });
+  }
+  return allText;
+}
+
+function parseTabLines(textLines) {
+  // Detect groups of 4-6 consecutive lines that look like tab notation
+  // Tab lines match patterns like: e|---0---2---| or E|---3h5---| or  D |-0-2-3-|
+  const tabLineRegex = /^[eEbBgGdDaA]\s*[\|┃\│][\d\-hpHPsS\/\\~xX\.\|┃\│\s]+$/;
+  const tabLineLoose = /[\|┃\│][\d\-hpHPsS\/\\~xX\.\s]{4,}/;
+
+  const groups = [];
+  let currentGroup = [];
+
+  for (let i = 0; i < textLines.length; i++) {
+    const line = textLines[i].trim();
+    if (!line) {
+      if (currentGroup.length >= 4) groups.push([...currentGroup]);
+      currentGroup = [];
+      continue;
+    }
+
+    const isTabLine = tabLineRegex.test(line) || (tabLineLoose.test(line) && /^[eEbBgGdDaA]/.test(line));
+    if (isTabLine) {
+      currentGroup.push(line);
+    } else {
+      if (currentGroup.length >= 4) groups.push([...currentGroup]);
+      currentGroup = [];
+    }
+  }
+  if (currentGroup.length >= 4) groups.push([...currentGroup]);
+
+  return groups;
+}
+
+function parseTabGroupToNotes(group, timeOffset, bpm) {
+  const notes = [];
+  const beatDuration = 60 / bpm;
+  // Each character position represents a fraction of a beat
+  const charTime = beatDuration * 0.25; // 16th note per character
+
+  // Determine string mapping from line labels
+  const stringMap = [];
+  group.forEach(line => {
+    const match = line.match(/^([eEbBgGdDaA])\s*[\|┃\│]/);
+    if (match) {
+      const label = match[1];
+      // Map to string index (0=high e, 5=low E)
+      if (label === "e") stringMap.push({ idx: 0, label });
+      else if (label === "B" || label === "b") stringMap.push({ idx: 1, label });
+      else if (label === "G" || label === "g") stringMap.push({ idx: 2, label });
+      else if (label === "D" || label === "d") stringMap.push({ idx: 3, label });
+      else if (label === "A" || label === "a") stringMap.push({ idx: 4, label });
+      else if (label === "E") stringMap.push({ idx: 5, label });
+    }
+  });
+
+  // If we can't determine strings, use default top-to-bottom mapping
+  if (stringMap.length === 0) {
+    group.forEach((_, i) => stringMap.push({ idx: i, label: STANDARD_TUNING[i] || "" }));
+  }
+
+  group.forEach((line, lineIdx) => {
+    const stringIdx = stringMap[lineIdx]?.idx ?? lineIdx;
+    // Find content after first | delimiter
+    const pipeIdx = line.search(/[\|┃\│]/);
+    if (pipeIdx === -1) return;
+    const content = line.slice(pipeIdx + 1);
+
+    let charPos = 0;
+    let i = 0;
+    while (i < content.length) {
+      const ch = content[i];
+      // Check for multi-digit fret numbers (e.g., "12", "15")
+      if (/\d/.test(ch)) {
+        let fretStr = ch;
+        if (i + 1 < content.length && /\d/.test(content[i + 1])) {
+          fretStr += content[i + 1];
+          i++;
+        }
+        const fret = parseInt(fretStr, 10);
+        const time = timeOffset + charPos * charTime;
+        notes.push({
+          string: stringIdx,
+          fret,
+          time: Math.round(time * 1000) / 1000,
+          duration: beatDuration * 0.5,
+        });
+      }
+      charPos++;
+      i++;
+    }
+  });
+
+  return notes;
+}
+
+function parsePdfTabsToSong(textLines, fileName, bpm = 120) {
+  const groups = parseTabLines(textLines);
+  if (groups.length === 0) return null;
+
+  const allNotes = [];
+  let timeOffset = 0;
+  const beatDuration = 60 / bpm;
+
+  groups.forEach(group => {
+    const notes = parseTabGroupToNotes(group, timeOffset, bpm);
+    allNotes.push(...notes);
+    // Estimate duration of this group from the longest line content
+    const maxChars = Math.max(...group.map(l => {
+      const pipeIdx = l.search(/[\|┃\│]/);
+      return pipeIdx >= 0 ? l.length - pipeIdx : l.length;
+    }));
+    timeOffset += maxChars * beatDuration * 0.25;
+  });
+
+  if (allNotes.length === 0) return null;
+
+  // Sort by time
+  allNotes.sort((a, b) => a.time - b.time || a.string - b.string);
+
+  // Detect tuning from the first group
+  const tuning = [...STANDARD_TUNING];
+  if (groups[0]) {
+    groups[0].forEach((line, i) => {
+      const match = line.match(/^([eEbBgGdDaA])/);
+      if (match && i < 6) tuning[i] = match[1];
+    });
+  }
+
+  const title = fileName.replace(/\.pdf$/i, "");
+  return {
+    id: "pdf-" + Date.now(),
+    title,
+    bpm,
+    fromPdf: true,
+    tracks: [{
+      name: "Guitar (from PDF)",
+      isDrum: false,
+      tuning,
+      notes: allNotes,
+    }],
+  };
+}
+// ============================================================================
 // PDF TAB VIEWER COMPONENT
 // ============================================================================
-function PDFTabViewer({ pdfDoc, fileName }) {
+function PDFTabViewer({ pdfDoc, fileName, onAnalyze, analyzing, analyzeResult }) {
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(0);
   const [zoom, setZoom] = useState(1.0);
@@ -150,6 +319,26 @@ function PDFTabViewer({ pdfDoc, fileName }) {
             Page {currentPage} of {totalPages} · {Math.round(zoom * 100)}% zoom
           </div>
         </div>
+      </div>
+      {/* Analyze Button */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+        <button onClick={() => onAnalyze && onAnalyze(120)} disabled={analyzing} style={{
+          padding: "10px 20px", borderRadius: 10, border: "none",
+          background: analyzing ? "rgba(255,255,255,0.06)" : "linear-gradient(135deg, #A55EEA, #45AAF2)",
+          color: "#fff", fontSize: 13, fontWeight: 700, cursor: analyzing ? "wait" : "pointer",
+          display: "flex", alignItems: "center", gap: 8, transition: "all 0.2s",
+          boxShadow: analyzing ? "none" : "0 4px 16px rgba(165,94,234,0.3)",
+        }}>
+          {analyzing ? "Analyzing..." : "Analyze Tabs & Play"}
+        </button>
+        {analyzeResult && (
+          <div style={{
+            padding: "8px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600,
+            background: analyzeResult.success ? "rgba(38,222,129,0.1)" : "rgba(255,77,106,0.1)",
+            border: `1px solid ${analyzeResult.success ? "rgba(38,222,129,0.2)" : "rgba(255,77,106,0.2)"}`,
+            color: analyzeResult.success ? "#26DE81" : "#FF4D6A",
+          }}>{analyzeResult.message}</div>
+        )}
       </div>
       {/* Controls */}
       <div style={{
@@ -262,6 +451,8 @@ export default function TabFlow() {
   const [pdfLibrary, setPdfLibrary] = useState([]);
   const [dragOver, setDragOver] = useState(false);
   const [pdfjsLoaded, setPdfjsLoaded] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeResult, setAnalyzeResult] = useState(null); // { success, message, noteCount }
   const canvasRef = useRef(null);
   const animRef = useRef(null);
   const lastTimeRef = useRef(null);
@@ -328,6 +519,35 @@ export default function TabFlow() {
     } catch (e) {
       setPdfError("Failed to reload PDF.");
     }
+  };
+  const analyzePdfTabs = async (bpm = 120) => {
+    if (!pdfDoc) return;
+    setAnalyzing(true);
+    setAnalyzeResult(null);
+    try {
+      const textLines = await extractTextFromPdf(pdfDoc);
+      const parsedSong = parsePdfTabsToSong(textLines, pdfFileName, bpm);
+      if (!parsedSong || parsedSong.tracks[0].notes.length === 0) {
+        setAnalyzeResult({ success: false, message: "No tab notation found in this PDF. Make sure it contains text-based ASCII guitar tabs (not scanned images)." });
+      } else {
+        const noteCount = parsedSong.tracks[0].notes.length;
+        // Add to library and load
+        setLibrary(prev => {
+          const exists = prev.find(s => s.id === parsedSong.id);
+          if (exists) return prev;
+          return [...prev, parsedSong];
+        });
+        setSong(parsedSong);
+        setActiveTrackIdx(0);
+        resetPlay();
+        setAnalyzeResult({ success: true, message: `Found ${noteCount} notes! Loading into player...`, noteCount });
+        setTimeout(() => setCurrentView("player"), 1200);
+      }
+    } catch (e) {
+      console.error("Tab analysis error:", e);
+      setAnalyzeResult({ success: false, message: "Error analyzing PDF. The file may not contain parseable tab notation." });
+    }
+    setAnalyzing(false);
   };
   const playNote = useCallback((midi) => {
     if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
@@ -657,7 +877,7 @@ export default function TabFlow() {
       )}
       {/* ===== PDF TAB VIEWER ===== */}
       {currentView === "pdf-viewer" && (
-        <PDFTabViewer pdfDoc={pdfDoc} fileName={pdfFileName} />
+        <PDFTabViewer pdfDoc={pdfDoc} fileName={pdfFileName} onAnalyze={analyzePdfTabs} analyzing={analyzing} analyzeResult={analyzeResult} />
       )}
       {/* ===== LIBRARY ===== */}
       {currentView === "library" && (
