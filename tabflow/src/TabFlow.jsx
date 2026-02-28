@@ -90,178 +90,143 @@ function getActiveSong(song, trackIdx) {
   return { ...song, notes: t.notes || [], tuning: t.tuning || ["e","B","G","D","A","E"] };
 }
 // ============================================================================
-// PDF TAB PARSER
+// CLAUDE VISION TAB EXTRACTION
 // ============================================================================
-const STANDARD_TUNING = ["e","B","G","D","A","E"];
-const STRING_LABELS = {
-  "e": 0, "B": 1, "b": 1, "G": 2, "g": 2, "D": 3, "d": 3, "A": 4, "a": 4, "E": 5,
-};
+const TAB_EXTRACTION_PROMPT = `You are a guitar tablature parser. Analyze this image of guitar tablature and extract every note into structured JSON.
 
-async function extractTextFromPdf(pdfDoc) {
-  const allText = [];
-  for (let i = 1; i <= pdfDoc.numPages; i++) {
-    const page = await pdfDoc.getPage(i);
-    const content = await page.getTextContent();
-    // Group text items by vertical position (y coordinate) to reconstruct lines
-    const lines = {};
-    content.items.forEach(item => {
-      const y = Math.round(item.transform[5]);
-      if (!lines[y]) lines[y] = [];
-      lines[y].push({ x: item.transform[4], text: item.str });
-    });
-    // Sort by y descending (PDF coords go bottom-up), then by x
-    const sortedYs = Object.keys(lines).map(Number).sort((a, b) => b - a);
-    sortedYs.forEach(y => {
-      const lineItems = lines[y].sort((a, b) => a.x - b.x);
-      allText.push(lineItems.map(i => i.text).join(""));
-    });
-  }
-  return allText;
+STEP 1 - IDENTIFY TUNING:
+Look at the string labels on the left side of each tab staff (e.g., e B G D A E). Map them to string indices:
+- String 0 = highest pitch string (usually high e)
+- String 1 = second string (usually B)
+- String 2 = third string (usually G)
+- String 3 = fourth string (usually D)
+- String 4 = fifth string (usually A)
+- String 5 = lowest pitch string (usually low E)
+If no labels are visible, assume standard tuning: ["e","B","G","D","A","E"].
+
+STEP 2 - READ NOTES LEFT TO RIGHT:
+Scan each tab staff from left to right. For each fret number you see:
+- Record which string (0-5) it appears on
+- Record the fret number
+- Assign a time value based on its horizontal position
+
+STEP 3 - GROUP CHORDS:
+Numbers that are vertically aligned (stacked at the same horizontal position) are played simultaneously. Give them the SAME time value.
+
+STEP 4 - ESTIMATE TIMING:
+- If a tempo/BPM marking is shown, use it. Otherwise assume 120 BPM.
+- Estimate note spacing from the horizontal distance between notes.
+- At 120 BPM, one beat = 0.5 seconds. A 16th note = 0.125 seconds.
+- Use the visual spacing to determine if notes are 8th notes (~0.25s apart), quarter notes (~0.5s apart), etc.
+- Duration: use 0.25s for regular notes, 0.5s for half notes, 1.0s for whole notes.
+
+STEP 5 - HANDLE TECHNIQUES:
+For hammer-ons (h), pull-offs (p), slides (/ \\), bends (b), vibrato (~): still output the fret number as a normal note.
+
+Return ONLY raw JSON with no markdown formatting, no code fences, no extra text:
+{"bpm":120,"tuning":["e","B","G","D","A","E"],"title":"Song Name","notes":[{"string":0,"fret":5,"time":0.0,"duration":0.25}]}`;
+
+async function renderPageToBase64(pdfDoc, pageNum) {
+  const page = await pdfDoc.getPage(pageNum);
+  const viewport = page.getViewport({ scale: 2.0 }); // Higher res for better OCR
+  const canvas = document.createElement("canvas");
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  const ctx = canvas.getContext("2d");
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  // Convert to base64 JPEG (smaller than PNG, good enough for vision)
+  return canvas.toDataURL("image/jpeg", 0.85).split(",")[1];
 }
 
-function parseTabLines(textLines) {
-  // Detect groups of 4-6 consecutive lines that look like tab notation
-  // Tab lines match patterns like: e|---0---2---| or E|---3h5---| or  D |-0-2-3-|
-  const tabLineRegex = /^[eEbBgGdDaA]\s*[\|┃\│][\d\-hpHPsS\/\\~xX\.\|┃\│\s]+$/;
-  const tabLineLoose = /[\|┃\│][\d\-hpHPsS\/\\~xX\.\s]{4,}/;
-
-  const groups = [];
-  let currentGroup = [];
-
-  for (let i = 0; i < textLines.length; i++) {
-    const line = textLines[i].trim();
-    if (!line) {
-      if (currentGroup.length >= 4) groups.push([...currentGroup]);
-      currentGroup = [];
-      continue;
-    }
-
-    const isTabLine = tabLineRegex.test(line) || (tabLineLoose.test(line) && /^[eEbBgGdDaA]/.test(line));
-    if (isTabLine) {
-      currentGroup.push(line);
-    } else {
-      if (currentGroup.length >= 4) groups.push([...currentGroup]);
-      currentGroup = [];
-    }
-  }
-  if (currentGroup.length >= 4) groups.push([...currentGroup]);
-
-  return groups;
-}
-
-function parseTabGroupToNotes(group, timeOffset, bpm) {
-  const notes = [];
-  const beatDuration = 60 / bpm;
-  // Each character position represents a fraction of a beat
-  const charTime = beatDuration * 0.25; // 16th note per character
-
-  // Determine string mapping from line labels
-  const stringMap = [];
-  group.forEach(line => {
-    const match = line.match(/^([eEbBgGdDaA])\s*[\|┃\│]/);
-    if (match) {
-      const label = match[1];
-      // Map to string index (0=high e, 5=low E)
-      if (label === "e") stringMap.push({ idx: 0, label });
-      else if (label === "B" || label === "b") stringMap.push({ idx: 1, label });
-      else if (label === "G" || label === "g") stringMap.push({ idx: 2, label });
-      else if (label === "D" || label === "d") stringMap.push({ idx: 3, label });
-      else if (label === "A" || label === "a") stringMap.push({ idx: 4, label });
-      else if (label === "E") stringMap.push({ idx: 5, label });
-    }
+async function callClaudeVision(apiKey, base64Image) {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-5-20250929",
+      max_tokens: 4096,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64Image } },
+          { type: "text", text: TAB_EXTRACTION_PROMPT },
+        ],
+      }],
+    }),
   });
-
-  // If we can't determine strings, use default top-to-bottom mapping
-  if (stringMap.length === 0) {
-    group.forEach((_, i) => stringMap.push({ idx: i, label: STANDARD_TUNING[i] || "" }));
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error?.message || `API error: ${response.status}`);
   }
-
-  group.forEach((line, lineIdx) => {
-    const stringIdx = stringMap[lineIdx]?.idx ?? lineIdx;
-    // Find content after first | delimiter
-    const pipeIdx = line.search(/[\|┃\│]/);
-    if (pipeIdx === -1) return;
-    const content = line.slice(pipeIdx + 1);
-
-    let charPos = 0;
-    let i = 0;
-    while (i < content.length) {
-      const ch = content[i];
-      // Check for multi-digit fret numbers (e.g., "12", "15")
-      if (/\d/.test(ch)) {
-        let fretStr = ch;
-        if (i + 1 < content.length && /\d/.test(content[i + 1])) {
-          fretStr += content[i + 1];
-          i++;
-        }
-        const fret = parseInt(fretStr, 10);
-        const time = timeOffset + charPos * charTime;
-        notes.push({
-          string: stringIdx,
-          fret,
-          time: Math.round(time * 1000) / 1000,
-          duration: beatDuration * 0.5,
-        });
-      }
-      charPos++;
-      i++;
-    }
-  });
-
-  return notes;
+  const data = await response.json();
+  const text = data.content?.[0]?.text || "";
+  // Extract JSON - try raw first, then fall back to code block extraction
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{")) {
+    return JSON.parse(trimmed);
+  }
+  const jsonMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (jsonMatch) return JSON.parse(jsonMatch[1].trim());
+  // Last resort: find first { to last }
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start !== -1 && end !== -1) return JSON.parse(trimmed.slice(start, end + 1));
+  throw new Error("Could not parse JSON from API response");
 }
 
-function parsePdfTabsToSong(textLines, fileName, bpm = 120) {
-  const groups = parseTabLines(textLines);
-  if (groups.length === 0) return null;
-
+async function extractTabsFromPDF(pdfDoc, apiKey, onProgress) {
   const allNotes = [];
-  let timeOffset = 0;
-  const beatDuration = 60 / bpm;
+  let bpm = 120;
+  let tuning = ["e", "B", "G", "D", "A", "E"];
+  let title = "";
+  let pageTimeOffset = 0;
 
-  groups.forEach(group => {
-    const notes = parseTabGroupToNotes(group, timeOffset, bpm);
-    allNotes.push(...notes);
-    // Estimate duration of this group from the longest line content
-    const maxChars = Math.max(...group.map(l => {
-      const pipeIdx = l.search(/[\|┃\│]/);
-      return pipeIdx >= 0 ? l.length - pipeIdx : l.length;
-    }));
-    timeOffset += maxChars * beatDuration * 0.25;
-  });
+  for (let i = 1; i <= pdfDoc.numPages; i++) {
+    if (onProgress) onProgress({ page: i, total: pdfDoc.numPages, status: "rendering" });
 
-  if (allNotes.length === 0) return null;
+    const base64 = await renderPageToBase64(pdfDoc, i);
 
-  // Sort by time
+    if (onProgress) onProgress({ page: i, total: pdfDoc.numPages, status: "analyzing" });
+
+    const result = await callClaudeVision(apiKey, base64);
+
+    if (result.bpm && i === 1) bpm = result.bpm;
+    if (result.tuning && i === 1) tuning = result.tuning;
+    if (result.title && !title) title = result.title;
+
+    if (result.notes && Array.isArray(result.notes)) {
+      // Offset notes from subsequent pages
+      const pageNotes = result.notes.map(n => ({
+        string: Math.max(0, Math.min(5, n.string)),
+        fret: Math.max(0, n.fret),
+        time: Math.round((n.time + pageTimeOffset) * 1000) / 1000,
+        duration: Math.max(0.1, n.duration || 0.25),
+      }));
+      allNotes.push(...pageNotes);
+
+      // Calculate offset for next page based on last note time
+      if (pageNotes.length > 0) {
+        const lastNote = pageNotes.reduce((a, b) => a.time + a.duration > b.time + b.duration ? a : b);
+        pageTimeOffset = lastNote.time + lastNote.duration + 0.5;
+      }
+    }
+  }
+
+  if (onProgress) onProgress({ page: pdfDoc.numPages, total: pdfDoc.numPages, status: "done" });
+
   allNotes.sort((a, b) => a.time - b.time || a.string - b.string);
 
-  // Detect tuning from the first group
-  const tuning = [...STANDARD_TUNING];
-  if (groups[0]) {
-    groups[0].forEach((line, i) => {
-      const match = line.match(/^([eEbBgGdDaA])/);
-      if (match && i < 6) tuning[i] = match[1];
-    });
-  }
-
-  const title = fileName.replace(/\.pdf$/i, "");
-  return {
-    id: "pdf-" + Date.now(),
-    title,
-    bpm,
-    fromPdf: true,
-    tracks: [{
-      name: "Guitar (from PDF)",
-      isDrum: false,
-      tuning,
-      notes: allNotes,
-    }],
-  };
+  return { notes: allNotes, bpm, tuning, title };
 }
 // ============================================================================
 // PDF TAB VIEWER COMPONENT
 // ============================================================================
-function PDFTabViewer({ pdfDoc, fileName, onAnalyze, analyzing, analyzeResult }) {
+function PDFTabViewer({ pdfDoc, fileName, onConvert, converting, convertProgress, convertResult, apiKey, onApiKeyChange }) {
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(0);
   const [zoom, setZoom] = useState(1.0);
@@ -320,24 +285,61 @@ function PDFTabViewer({ pdfDoc, fileName, onAnalyze, analyzing, analyzeResult })
           </div>
         </div>
       </div>
-      {/* Analyze Button */}
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
-        <button onClick={() => onAnalyze && onAnalyze(120)} disabled={analyzing} style={{
-          padding: "10px 20px", borderRadius: 10, border: "none",
-          background: analyzing ? "rgba(255,255,255,0.06)" : "linear-gradient(135deg, #A55EEA, #45AAF2)",
-          color: "#fff", fontSize: 13, fontWeight: 700, cursor: analyzing ? "wait" : "pointer",
-          display: "flex", alignItems: "center", gap: 8, transition: "all 0.2s",
-          boxShadow: analyzing ? "none" : "0 4px 16px rgba(165,94,234,0.3)",
-        }}>
-          {analyzing ? "Analyzing..." : "Analyze Tabs & Play"}
-        </button>
-        {analyzeResult && (
+      {/* Convert to Playable Tabs */}
+      <div style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <input
+            type="password"
+            placeholder="Claude API Key (sk-ant-...)"
+            value={apiKey}
+            onChange={e => onApiKeyChange(e.target.value)}
+            style={{
+              padding: "9px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.1)",
+              background: "rgba(255,255,255,0.04)", color: "#fff", fontSize: 12,
+              fontFamily: "'JetBrains Mono', monospace", width: 260, outline: "none",
+            }}
+          />
+          <button onClick={() => onConvert && onConvert()} disabled={converting || !apiKey} style={{
+            padding: "10px 20px", borderRadius: 10, border: "none",
+            background: (converting || !apiKey) ? "rgba(255,255,255,0.06)" : "linear-gradient(135deg, #A55EEA, #45AAF2)",
+            color: "#fff", fontSize: 13, fontWeight: 700,
+            cursor: (converting || !apiKey) ? "not-allowed" : "pointer",
+            display: "flex", alignItems: "center", gap: 8, transition: "all 0.2s",
+            boxShadow: (converting || !apiKey) ? "none" : "0 4px 16px rgba(165,94,234,0.3)",
+            opacity: !apiKey ? 0.5 : 1,
+          }}>
+            {converting ? "Converting..." : "Convert to Playable Tabs"}
+          </button>
+        </div>
+        {converting && convertProgress && (
           <div style={{
-            padding: "8px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600,
-            background: analyzeResult.success ? "rgba(38,222,129,0.1)" : "rgba(255,77,106,0.1)",
-            border: `1px solid ${analyzeResult.success ? "rgba(38,222,129,0.2)" : "rgba(255,77,106,0.2)"}`,
-            color: analyzeResult.success ? "#26DE81" : "#FF4D6A",
-          }}>{analyzeResult.message}</div>
+            marginTop: 10, padding: "10px 14px", borderRadius: 8,
+            background: "rgba(69,170,242,0.08)", border: "1px solid rgba(69,170,242,0.15)",
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <span style={{ fontSize: 12, color: "#45AAF2", fontWeight: 600 }}>
+                Page {convertProgress.page} of {convertProgress.total} — {convertProgress.status === "rendering" ? "Rendering page..." : "Analyzing with Claude..."}
+              </span>
+              <span style={{ fontSize: 11, color: "#666", fontFamily: "'JetBrains Mono', monospace" }}>
+                {Math.round((convertProgress.page / convertProgress.total) * 100)}%
+              </span>
+            </div>
+            <div style={{ height: 4, borderRadius: 2, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
+              <div style={{
+                height: "100%", borderRadius: 2, transition: "width 0.3s",
+                background: "linear-gradient(90deg, #A55EEA, #45AAF2)",
+                width: `${(convertProgress.page / convertProgress.total) * 100}%`,
+              }} />
+            </div>
+          </div>
+        )}
+        {convertResult && (
+          <div style={{
+            marginTop: 10, padding: "10px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600,
+            background: convertResult.success ? "rgba(38,222,129,0.08)" : "rgba(255,77,106,0.08)",
+            border: `1px solid ${convertResult.success ? "rgba(38,222,129,0.15)" : "rgba(255,77,106,0.15)"}`,
+            color: convertResult.success ? "#26DE81" : "#FF4D6A",
+          }}>{convertResult.message}</div>
         )}
       </div>
       {/* Controls */}
@@ -451,8 +453,12 @@ export default function TabFlow() {
   const [pdfLibrary, setPdfLibrary] = useState([]);
   const [dragOver, setDragOver] = useState(false);
   const [pdfjsLoaded, setPdfjsLoaded] = useState(false);
-  const [analyzing, setAnalyzing] = useState(false);
-  const [analyzeResult, setAnalyzeResult] = useState(null); // { success, message, noteCount }
+  const [apiKey, setApiKey] = useState(() => {
+    try { return localStorage.getItem("tabflow_api_key") || ""; } catch { return ""; }
+  });
+  const [converting, setConverting] = useState(false);
+  const [convertProgress, setConvertProgress] = useState(null);
+  const [convertResult, setConvertResult] = useState(null);
   const canvasRef = useRef(null);
   const animRef = useRef(null);
   const lastTimeRef = useRef(null);
@@ -520,34 +526,48 @@ export default function TabFlow() {
       setPdfError("Failed to reload PDF.");
     }
   };
-  const analyzePdfTabs = async (bpm = 120) => {
-    if (!pdfDoc) return;
-    setAnalyzing(true);
-    setAnalyzeResult(null);
+  const handleApiKeyChange = (key) => {
+    setApiKey(key);
+    try { localStorage.setItem("tabflow_api_key", key); } catch {}
+  };
+  const convertPdfTabs = async () => {
+    if (!pdfDoc || !apiKey) return;
+    setConverting(true);
+    setConvertResult(null);
+    setConvertProgress(null);
     try {
-      const textLines = await extractTextFromPdf(pdfDoc);
-      const parsedSong = parsePdfTabsToSong(textLines, pdfFileName, bpm);
-      if (!parsedSong || parsedSong.tracks[0].notes.length === 0) {
-        setAnalyzeResult({ success: false, message: "No tab notation found in this PDF. Make sure it contains text-based ASCII guitar tabs (not scanned images)." });
+      const result = await extractTabsFromPDF(pdfDoc, apiKey, setConvertProgress);
+      if (!result.notes || result.notes.length === 0) {
+        setConvertResult({ success: false, message: "No tab notation found in this PDF. The pages may not contain readable guitar tabs." });
       } else {
-        const noteCount = parsedSong.tracks[0].notes.length;
-        // Add to library and load
-        setLibrary(prev => {
-          const exists = prev.find(s => s.id === parsedSong.id);
-          if (exists) return prev;
-          return [...prev, parsedSong];
-        });
-        setSong(parsedSong);
+        const title = result.title || pdfFileName.replace(/\.pdf$/i, "");
+        const newSong = {
+          id: "pdf-" + Date.now(),
+          title,
+          bpm: result.bpm || 120,
+          fromPdf: true,
+          tracks: [{
+            name: "Guitar (from PDF)",
+            isDrum: false,
+            tuning: result.tuning || ["e","B","G","D","A","E"],
+            notes: result.notes,
+          }],
+        };
+        setLibrary(prev => [...prev, newSong]);
+        setSong(newSong);
         setActiveTrackIdx(0);
         resetPlay();
-        setAnalyzeResult({ success: true, message: `Found ${noteCount} notes! Loading into player...`, noteCount });
-        setTimeout(() => setCurrentView("player"), 1200);
+        setConvertResult({ success: true, message: `Extracted ${result.notes.length} notes! Loading into player...` });
+        setTimeout(() => setCurrentView("player"), 1500);
       }
     } catch (e) {
-      console.error("Tab analysis error:", e);
-      setAnalyzeResult({ success: false, message: "Error analyzing PDF. The file may not contain parseable tab notation." });
+      console.error("Conversion error:", e);
+      const msg = e.message?.includes("401") ? "Invalid API key. Check your Claude API key and try again."
+        : e.message?.includes("429") ? "Rate limited. Please wait a moment and try again."
+        : `Conversion failed: ${e.message}`;
+      setConvertResult({ success: false, message: msg });
     }
-    setAnalyzing(false);
+    setConverting(false);
   };
   const playNote = useCallback((midi) => {
     if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
@@ -877,7 +897,7 @@ export default function TabFlow() {
       )}
       {/* ===== PDF TAB VIEWER ===== */}
       {currentView === "pdf-viewer" && (
-        <PDFTabViewer pdfDoc={pdfDoc} fileName={pdfFileName} onAnalyze={analyzePdfTabs} analyzing={analyzing} analyzeResult={analyzeResult} />
+        <PDFTabViewer pdfDoc={pdfDoc} fileName={pdfFileName} onConvert={convertPdfTabs} converting={converting} convertProgress={convertProgress} convertResult={convertResult} apiKey={apiKey} onApiKeyChange={handleApiKeyChange} />
       )}
       {/* ===== LIBRARY ===== */}
       {currentView === "library" && (
